@@ -7,9 +7,9 @@ concurrency:
 
 on:
   schedule:
-    # Mon–Sat 21:00 Beijing (13:00 UTC): Mon/Wed/Fri AWS P0; Tue/Thu AWS P1+Meta P0; Sat AWS P2+OOB (see load-models).
+    # Mon-Sat 21:00 Beijing (13:00 UTC): Mon/Wed AWS P0; Tue/Thu AWS P0+Meta P0; Fri AWS all; Sat AWS P0+OOB.
     - cron: '0 13 * * 1-6'
-    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+Meta P0; Sun Meta P1
+    # Sat/Sun 10:00 Beijing (02:00 UTC): Sat AWS P1+P2+Meta P0; Sun AWS all+Meta P1.
     - cron: '0 2 * * 0,6'
   workflow_dispatch:
     inputs:
@@ -894,29 +894,29 @@ jobs:
               ]
 
           AWS_P0 = {
-              "MiniMax-M2.5 TP2 (AW)",
-              "MiniMax-M2.5 TP4 (AW)",
-              "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "gpt-oss-120b TP1 (AW)",
+              "DeepSeek-V3.2 FP8 TP4 (AW)",
               "DeepSeek-V3.2 FP8 MTP TP4 (AW)",
-              "gpt-oss-120b TP2 (AW)",
-              "gpt-oss-120b TP8 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
+              "GLM-4.7-FP8 TP4 (AW)",
+              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP4 (AW)",
+              "MiniMax-M2.5 TP2 (AW)",
           }
           AWS_P1 = {
-              "GLM-4.7-FP8 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP4 (AW)",
-              "Kimi-K2.5-MXFP4 TP8 (AW)",
-              "GLM-4.7-FP8 MTP TP4 (AW)",
+              "MiniMax-M2.5 TP4 (AW)",
+              "DeepSeek-V3.2 FP8 TP8 (AW)",
+              "gpt-oss-120b TP2 (AW)",
+              "gpt-oss-120b TP8 (AW)",
               "GLM-4.7-FP8 MTP TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
           AWS_P2 = {
-              "DeepSeek-V3.2 FP8 TP4 (AW)",
               "GLM-4.7-FP8 TP8 (AW)",
-              "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (AW)",
+              "Kimi-K2.5-MXFP4 TP8 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP2 (AW)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (AW)",
-              "gpt-oss-120b TP1 (AW)",
+              "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 (AW)",
           }
           META_P0 = {
               "Kimi-K2.5-MXFP4 TP4 (MET)",
@@ -927,7 +927,6 @@ jobs:
               "Kimi-K2-Thinking-MXFP4 TP8 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP1 (MET)",
               "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 (MET)",
-              "Qwen3.5-397B-A17B-FP8 TP4 (OOB)",
               "DeepSeek-R1 FP8 TP8 (MET)",
               "DeepSeek-R1 MXFP4 TP8 (MET)",
           }
@@ -951,26 +950,24 @@ jobs:
 
               # Beijing weekday: Mon=0 .. Sun=6. Hour buckets use 15:00 to split
               # ~10:00 daytime vs ~21:00 evening scheduled runs.
-              # Mon/Wed/Fri evening: AWS P0. Tue/Thu evening: AWS P1 + Meta P0.
-              # Fri evening: AWS P0. Sat daytime (~10:00): AWS P1 + Meta P0.
-              # Sat evening (~21:00): AWS P2 + OOB. Sun daytime (~10:00): Meta P1.
               is_daytime_slot = beijing_hour < 15
+              aws_all = AWS_P0 | AWS_P1 | AWS_P2
 
               if beijing_weekday == 5:  # Saturday
                   if is_daytime_slot:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AWS-P1+P2+META-P0"
+                      target_displays = AWS_P1 | AWS_P2 | META_P0
                   else:
-                      selected_group = "AWS-P2+OOB"
-                      target_displays = AWS_P2 | OOB_DISPLAYS
+                      selected_group = "AWS-P0+OOB"
+                      target_displays = AWS_P0 | OOB_DISPLAYS
               elif beijing_weekday == 6:  # Sunday
                   if is_daytime_slot:
-                      selected_group = "META-P1"
-                      target_displays = META_P1
+                      selected_group = "AWS-ALL+META-P1"
+                      target_displays = aws_all | META_P1
                   else:
                       selected_group = "SKIP"
                       target_displays = set()
-              elif beijing_weekday in (0, 2, 4):  # Mon / Wed / Fri
+              elif beijing_weekday in (0, 2):  # Mon / Wed
                   if is_daytime_slot:
                       selected_group = "SKIP"
                       target_displays = set()
@@ -982,8 +979,15 @@ jobs:
                       selected_group = "SKIP"
                       target_displays = set()
                   else:
-                      selected_group = "AWS-P1+META-P0"
-                      target_displays = AWS_P1 | META_P0
+                      selected_group = "AWS-P0+META-P0"
+                      target_displays = AWS_P0 | META_P0
+              elif beijing_weekday == 4:  # Friday
+                  if is_daytime_slot:
+                      selected_group = "SKIP"
+                      target_displays = set()
+                  else:
+                      selected_group = "AWS-ALL"
+                      target_displays = aws_all
               else:
                   selected_group = "SKIP"
                   target_displays = set()
