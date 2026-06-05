@@ -35,11 +35,11 @@ on:
         description: "SGLang repo"
         default: "https://github.com/sgl-project/sglang.git"
       sglang_ref:
-        description: "SGLang git ref"
-        default: "v0.5.10"
+        description: "SGLang git ref. Leave empty to use the workflow default."
+        default: ""
       sglang_version:
-        description: "SGLang version used in the published tag"
-        default: "0.5.10"
+        description: "SGLang version used in the published tag. Leave empty to use the workflow default."
+        default: ""
       runner:
         description: "Runner label to use"
         type: choice
@@ -99,8 +99,8 @@ jobs:
       VLLM_COMMIT: "0b3ba88f165976e77ca5e6a7a3f5bba4562b80af"
       VLLM_VERSION: "0.22.0"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.10"
-      SGLANG_VERSION: "0.5.10"
+      SGLANG_REF: "v0.5.12"
+      SGLANG_VERSION: "0.5.12"
 
     steps:
       - name: Set HF_TOKEN
