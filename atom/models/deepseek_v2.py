@@ -127,6 +127,7 @@ ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_F
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
     envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 )
+SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -1231,28 +1232,69 @@ def sparse_attn_indexer(
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
         num_tokens = hidden_states.shape[0]
-        logits = fp8_mqa_logits(
-            Q=q_fp8[num_decode_tokens:num_tokens],
-            KV=k_fp8,
-            kv_scales=k_scale,
-            weights=weights[num_decode_tokens:num_tokens],
-            cu_starts=cu_seqlen_ks,
-            cu_ends=cu_seqlen_ke,
-        )
-
-        num_rows = logits.shape[0]
+        q_prefill = q_fp8[num_decode_tokens:num_tokens]
+        weights_prefill = weights[num_decode_tokens:num_tokens]
+        num_rows = q_prefill.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
-        top_k_per_row_prefill(
-            logits=logits,
-            rowStarts=cu_seqlen_ks,
-            rowEnds=cu_seqlen_ke,
-            indices=topk_indices_prefill,
-            values=None,
-            numRows=num_rows,
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-        )
+        # The dense logits buffer is [num_rows, total_kv] fp32. total_kv is the
+        # sum of all co-scheduled prefill contexts and is unbounded by
+        # max_num_batched_tokens, so a burst of long-context requests can push a
+        # single allocation to tens of GiB (#1376). Under chunked prefill
+        # num_rows is already capped by max_num_batched_tokens, so the OOM is
+        # driven by total_kv (the column dim). Chunk along the Q (query-row)
+        # dimension with q_chunk sized so the buffer [q_chunk, total_kv] fp32
+        # stays within the memory budget — q_chunk shrinks as total_kv grows.
+        # Each chunk still scores the FULL KV, so every row's top-k is computed
+        # completely in one shot: the result is exact with no cross-chunk merge,
+        # the kernel's column indices are already global (no remapping), and each
+        # chunk writes straight into its output row slice (no copy). When the
+        # budget is disabled (0) or a single chunk fits, the loop runs exactly
+        # once and matches the original single-shot behavior.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and total_kv > 0
+            and budget_bytes // (total_kv * 4) < num_rows
+        ):
+            # 4 bytes per fp32 logit; total_kv * 4 is one query row's footprint.
+            # Round the budget-derived row count DOWN to keep the buffer within
+            # budget: a multiple of 128 (aligned to the kernel's row tiling) in
+            # the normal regime, avoiding the coarse power-of-2 doubling. When
+            # the budget affords < 128 rows (extreme total_kv), fall back to a
+            # power-of-2 floor so it degrades to 64/32/.../1 instead of
+            # collapsing straight to 1.
+            budget_rows = budget_bytes // (total_kv * 4)
+            if budget_rows >= 128:
+                chunk_tokens = (budget_rows // 128) * 128
+            else:
+                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
+        else:
+            # Budget disabled, or a single chunk already fits all rows.
+            chunk_tokens = num_rows
+        for chunk_start in range(0, num_rows, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+            # Per-row window bounds slice 1:1 with this chunk's rows.
+            row_starts = cu_seqlen_ks[chunk_start:chunk_end]
+            row_ends = cu_seqlen_ke[chunk_start:chunk_end]
+            logits = fp8_mqa_logits(
+                Q=q_prefill[chunk_start:chunk_end],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights_prefill[chunk_start:chunk_end],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
+            )
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=row_starts,
+                rowEnds=row_ends,
+                indices=topk_indices_prefill[chunk_start:chunk_end],
+                values=None,
+                numRows=chunk_end - chunk_start,
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+            )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
