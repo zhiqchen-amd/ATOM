@@ -29,6 +29,10 @@ from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
+from atom.model_ops.eplb import (
+    initialize_eplb_runtime,
+    with_eplb_forward_monitor,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.eagle import EagleProposer
@@ -42,10 +46,17 @@ from atom.utils import (
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
 from atom.utils.tbo import (
+    UBatchSlice,
     UBatchWrapper,
     local_tbo_precompute,
     maybe_create_ubatch_slices,
     sync_dp_metadata,
+)
+from atom.distributed.pcp_utils import (
+    PcpBalGroup,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+    pcp_round_robin_split,
 )
 from atom.utils.forward_context import (
     Context,
@@ -847,6 +858,7 @@ class ModelRunner:
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         self.forward_done_event = torch.cuda.Event()
+        initialize_eplb_runtime(self)
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -2089,6 +2101,56 @@ class ModelRunner:
                 )
             )
 
+        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
+        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
+        # request subset". Requires num_reqs >= 2 (request-boundary split needs
+        # two non-empty groups); bs=1 falls back to non-TBO.
+        pcp_size = self.config.prefill_context_parallel_size
+        # True for eligible PCP+TBO request-boundary split prefill; read by
+        # build_ubatch / run_model / prepare_prefill to route the per-group path.
+        self._pcp_tbo_balanced_active = False
+        # Per-group descriptors; reset each step, set in prepare_inputs
+        # request-boundary-split branch. Guards run_model/build_ubatch against
+        # stale values.
+        self._pcp_bal_groups = None
+        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            num_prefill_reqs = batch.total_seqs_num_prefill
+            n_prefill = batch.total_tokens_num_prefill
+            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
+            # dp_size<=1 fast path below returns local_eligible verbatim as
+            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
+            # sync path (never hit under PCP).
+            local_tokens = n_prefill // pcp_size
+            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
+            local_ub0 = local_tokens // 2
+            local_ub1 = local_tokens - local_ub0
+            self._pcp_tbo_balanced_active = local_eligible
+
+        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
+        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
+        # request subset". Requires num_reqs >= 2 (request-boundary split needs
+        # two non-empty groups); bs=1 falls back to non-TBO.
+        pcp_size = self.config.prefill_context_parallel_size
+        # True for eligible PCP+TBO request-boundary split prefill; read by
+        # build_ubatch / run_model / prepare_prefill to route the per-group path.
+        self._pcp_tbo_balanced_active = False
+        # Per-group descriptors; reset each step, set in prepare_inputs
+        # request-boundary-split branch. Guards run_model/build_ubatch against
+        # stale values.
+        self._pcp_bal_groups = None
+        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            num_prefill_reqs = batch.total_seqs_num_prefill
+            n_prefill = batch.total_tokens_num_prefill
+            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
+            # dp_size<=1 fast path below returns local_eligible verbatim as
+            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
+            # sync path (never hit under PCP).
+            local_tokens = n_prefill // pcp_size
+            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
+            local_ub0 = local_tokens // 2
+            local_ub1 = local_tokens - local_ub0
+            self._pcp_tbo_balanced_active = local_eligible
+
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
             # Both bits must hold (reached min-tokens AND able to split).
@@ -2451,6 +2513,10 @@ class ModelRunner:
             ub_max_tokens_across_dp,
             _dspark_shape_max,
         ) = preprocessed
+
+        if not tbo_collective_active:
+            self._pcp_tbo_balanced_active = False
+
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         # mtp_step = per-seq decode token count, used by ForwardMode.decide to
@@ -2539,14 +2605,29 @@ class ModelRunner:
                 input_ids,
             )
 
-        ubatch_slices = self._maybe_create_tbo_slices(
-            batch,
-            is_prefill,
-            scheduled_bs if not is_prefill else 0,
-            actual_num_tokens,
-            num_scheduled_tokens,
-            tbo_collective_active,
+        pcp_size = self.config.prefill_context_parallel_size
+        _pcp_tbo_balanced = (
+            is_prefill
+            and pcp_size > 1
+            and tbo_collective_active
+            and not batch.is_dummy_run
+            and getattr(self, "_pcp_tbo_balanced_active", False)
         )
+        if _pcp_tbo_balanced:
+            # Request-boundary split for PCP+TBO prefill (see
+            # _build_pcp_balanced_slices). forward_vars stay GLOBAL here.
+            ubatch_slices, self._pcp_bal_groups = self._build_pcp_balanced_slices(
+                batch, num_scheduled_tokens, pcp_size
+            )
+        else:
+            ubatch_slices = self._maybe_create_tbo_slices(
+                batch,
+                is_prefill,
+                scheduled_bs if not is_prefill else 0,
+                actual_num_tokens,
+                num_scheduled_tokens,
+                tbo_collective_active,
+            )
 
         set_forward_context(
             attn_metadata=attn_metadata,
@@ -2640,6 +2721,117 @@ class ModelRunner:
             needs_independent_noise,
         )
 
+    def _build_pcp_balanced_slices(
+        self,
+        batch: ScheduledBatch,
+        num_scheduled_tokens: np.ndarray,
+        pcp_size: int,
+    ) -> "tuple[list[UBatchSlice], list[PcpBalGroup]]":
+        """Build request-boundary-split ubatch slices for PCP+TBO prefill.
+
+        Split REQUESTS into two groups at a request boundary near the token
+        midpoint. Each group is an independent "non-TBO PCP mini-batch": padded
+        to a pcp multiple and round-robin striped as a whole, so every sequence
+        stays intact in one group (root-fixes token-split R1/R2). forward_vars
+        stay GLOBAL here; build_ubatch_prefill_metadata slices the FULL
+        (un-reindexed) metadata per group and calls _apply_pcp_reindex on it.
+
+        Returns (ubatch_slices, groups): token_slice is in the LOCAL concat
+        space [g0_local | g1_local] that run_model produces (see
+        _apply_pcp_balanced_stripe); groups are the PcpBalGroup descriptors
+        consumed by run_model (per-group stripe) and
+        build_ubatch_prefill_metadata (slice + reindex).
+        """
+        num_prefill_reqs = batch.total_seqs_num_prefill
+        per_req = np.asarray(num_scheduled_tokens[:num_prefill_reqs], dtype=np.int64)
+        total_tok = int(per_req.sum())
+        cum = np.cumsum(per_req)  # cum[j] = sum of reqs [0..j]
+        target = total_tok // 2
+        # request boundary whose cumulative token count is closest to target
+        split_idx = int(np.searchsorted(cum, target, side="left")) + 1
+        split_idx = max(1, min(split_idx, num_prefill_reqs - 1))
+        # global token count of group0 (reqs [0:split_idx])
+        b0 = int(cum[split_idx - 1])
+        h0 = pcp_pad_len(b0, pcp_size)
+        h1 = pcp_pad_len(total_tok - b0, pcp_size)
+        l0 = h0 // pcp_size
+        l1 = h1 // pcp_size
+        ubatch_slices = [
+            UBatchSlice(
+                request_slice=slice(0, split_idx),
+                token_slice=slice(0, l0),
+            ),
+            UBatchSlice(
+                request_slice=slice(split_idx, num_prefill_reqs),
+                token_slice=slice(l0, l0 + l1),
+            ),
+        ]
+        groups = [
+            PcpBalGroup(0, split_idx, 0, b0, h0),
+            PcpBalGroup(split_idx, num_prefill_reqs, b0, total_tok, h1),
+        ]
+        return ubatch_slices, groups
+
+    def _apply_pcp_balanced_stripe(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        groups: "list[PcpBalGroup]",
+        pcp_size: int,
+        forward_context,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """PCP+TBO prefill per-group round-robin stripe, before UBatchWrapper.
+
+        Each request group is padded to a pcp multiple and round-robin striped
+        as a WHOLE (so sequences stay intact per group), then the two groups'
+        1/pcp shards are concatenated into [g0_local | g1_local]. token_slice
+        (built in prepare_inputs) indexes into this concat. Returns the striped
+        (input_ids, positions).
+        """
+        g_ids, g_pos = [], []
+        for grp in groups:
+            seg_ids = input_ids[grp.tok_start : grp.tok_end]
+            seg_pos = positions[grp.tok_start : grp.tok_end]
+            pad = grp.pad_total - (grp.tok_end - grp.tok_start)
+            if pad > 0:
+                seg_ids = torch.cat([seg_ids, seg_ids.new_zeros(pad)])
+                seg_pos = torch.cat([seg_pos, seg_pos.new_zeros(pad)])
+            g_ids.append(pcp_round_robin_split(seg_ids, pcp_size))
+            g_pos.append(pcp_round_robin_split(seg_pos, pcp_size))
+        input_ids = torch.cat(g_ids)
+        positions = torch.cat(g_pos)
+        # context.positions = local per-group concat so _make_ubatch_context
+        # slices each ubatch's forward positions correctly.
+        forward_context.context.positions = positions
+        # Hash MoE: local per-group-concat ids. Each ForCausalLM.forward
+        # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
+        # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
+        if envs.ATOM_PCP_MOE_MERGE:
+            forward_context.context.input_ids = input_ids
+        return input_ids, positions
+
+    def _restore_pcp_balanced_output(
+        self,
+        mo: torch.Tensor,
+        groups: "list[PcpBalGroup]",
+        pcp_size: int,
+    ) -> torch.Tensor:
+        """Restore PCP+TBO request-boundary-split output.
+
+        UBatchWrapper concatenated the two groups' 1/pcp output shards
+        [g0_local | g1_local]. Each group was striped independently, so restore
+        per group: pcp_allgather_rerange its shard back to the group's global
+        order, crop the per-group pad, then concat to the full global sequence.
+        """
+        outs = []
+        off = 0
+        for grp in groups:
+            local_len = grp.pad_total // pcp_size  # group's 1/pcp token count
+            seg = pcp_allgather_rerange(mo[off : off + local_len], pcp_size)
+            outs.append(seg[: grp.tok_end - grp.tok_start])  # crop per-group pad
+            off += local_len
+        return torch.cat(outs)
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -2680,6 +2872,39 @@ class ModelRunner:
             batch=batch,
         )
 
+        # Profiler label. Kind (prefix) distinguishes real/dummy and
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
+        # `build_run_label`.
+        label = build_run_label(
+            is_prefill=is_prefill,
+            use_cudagraph=forward_mode.use_cudagraph,
+            is_dummy=context.is_dummy_run,
+            tbo_on=forward_context.ubatch_slices is not None,
+            bs=bs,
+            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
+            # the label shows bs=<real>/<graph> when they differ.
+            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
+            batch=batch,
+        )
+
+        # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
+        # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
+        # output restore further below.
+        _pcp_size = self.config.prefill_context_parallel_size
+        _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
+        _pcp_tbo_balanced = (
+            _pcp_size > 1
+            and isinstance(self.model, UBatchWrapper)
+            and forward_context.ubatch_slices is not None
+            and is_prefill
+            and not forward_context.context.is_dummy_run
+            and _pcp_bal_groups is not None
+        )
+        if _pcp_tbo_balanced:
+            input_ids, positions = self._apply_pcp_balanced_stripe(
+                input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
+            )
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
@@ -2715,6 +2940,25 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                # PCP+TBO prefill (request-boundary split): UBatchWrapper concatenated the two
+                # groups' 1/pcp output shards [g0_local | g1_local]. Restore each
+                # group independently: pcp_allgather_rerange its shard back to the
+                # group's global order, crop off the per-group pad, then concat to
+                # the full global sequence. Per-group (not single global) because
+                # each group was striped independently.
+                if _pcp_tbo_balanced:
+                    if self.use_aux_hidden_state_outputs:
+                        _h, _aux = model_output
+                        model_output = (
+                            self._restore_pcp_balanced_output(
+                                _h, _pcp_bal_groups, _pcp_size
+                            ),
+                            _aux,
+                        )
+                    else:
+                        model_output = self._restore_pcp_balanced_output(
+                            model_output, _pcp_bal_groups, _pcp_size
+                        )
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, self._aux_hidden_states = model_output
                 else:
@@ -2941,6 +3185,7 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
+    @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         (
             input_ids,
