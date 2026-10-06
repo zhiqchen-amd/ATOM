@@ -389,6 +389,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token count saved under this path prefix (mono/timeline.py). Use with
     # --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
+    # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
+    # records its region, pair and tags, and the runner raises with them at the end
+    # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
+    # with --enforce-eager.
+    "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -500,6 +505,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
+    ),
+    # --- Shutdown ---
+    # How long a shutting-down process waits for its children (EngineCore,
+    # ModelRunner workers) to exit before it terminates them.
+    "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_SHUTDOWN_TIMEOUT_S", "5"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
